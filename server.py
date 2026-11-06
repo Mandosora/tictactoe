@@ -3,8 +3,10 @@
 Run:   py server.py
 Open:  http://localhost:8000  (or the network address it prints, from a phone on the same Wi-Fi)
 
-Uses only the Python standard library: accounts are stored in SQLite (data/app.db),
-games live in memory, and the browser gets live updates through long polling.
+Uses only the Python standard library. Games live in memory and the browser gets live
+updates through long polling. Accounts and stats are stored:
+  - in Neon Postgres when the DATABASE_URL environment variable is set (used online), or
+  - in a local SQLite file, data/app.db, otherwise.
 """
 import hashlib
 import hmac
@@ -17,6 +19,8 @@ import sqlite3
 import threading
 import time
 import traceback
+import urllib.error
+import urllib.request
 from contextlib import closing
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -24,8 +28,10 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parent
-PUBLIC = ROOT / "public"
+# Web files normally live in public/, but also work if they were uploaded next to server.py.
+PUBLIC = ROOT / "public" if (ROOT / "public" / "index.html").is_file() else ROOT
 DB_PATH = ROOT / "data" / "app.db"
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -57,78 +63,188 @@ class ApiError(Exception):
 
 # --------------------------------------------------------------------------- database
 
-def db():
-    conn = sqlite3.connect(DB_PATH, timeout=10)
-    conn.row_factory = sqlite3.Row
-    return conn
+# SQL below is written with "?" placeholders and works on both SQLite and Postgres.
+
+class DuplicateError(Exception):
+    """A unique value (e.g. a username) already exists."""
 
 
-def db_exec(sql, args=()):
-    with closing(db()) as conn, conn:
-        return conn.execute(sql, args).lastrowid
+class SqliteDB:
+    name = "local file data/app.db"
+
+    def __init__(self, path):
+        self.path = path
+
+    def query(self, sql, args=()):
+        with closing(sqlite3.connect(self.path, timeout=10)) as conn, conn:
+            conn.row_factory = sqlite3.Row
+            try:
+                return [dict(row) for row in conn.execute(sql, args).fetchall()]
+            except sqlite3.IntegrityError as err:
+                raise DuplicateError() from err
+
+    def init(self):
+        self.path.parent.mkdir(exist_ok=True)
+        with closing(sqlite3.connect(self.path)) as conn, conn:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id       INTEGER PRIMARY KEY,
+                    username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    pw_hash  TEXT NOT NULL,
+                    salt     TEXT NOT NULL,
+                    wins     INTEGER NOT NULL DEFAULT 0,
+                    losses   INTEGER NOT NULL DEFAULT 0,
+                    draws    INTEGER NOT NULL DEFAULT 0,
+                    created  REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS sessions (
+                    token   TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id),
+                    expires REAL NOT NULL
+                );
+            """)
+
+
+class NeonDB:
+    """Neon Postgres over Neon's HTTPS query endpoint, so no database driver is needed."""
+
+    def __init__(self, url):
+        self.url = url
+        self.host = urlparse(url).hostname
+        self.endpoint = f"https://{self.host}/sql"
+        self.name = f"Neon Postgres ({self.host})"
+
+    def query(self, sql, args=()):
+        # Turn ? placeholders into Postgres-style $1, $2, ...
+        parts = sql.split("?")
+        sql = parts[0] + "".join(f"${i}{part}" for i, part in enumerate(parts[1:], start=1))
+        params = [None if a is None else str(a) for a in args]
+        request = urllib.request.Request(
+            self.endpoint, method="POST",
+            data=json.dumps({"query": sql, "params": params}).encode(),
+            headers={"Content-Type": "application/json", "Neon-Connection-String": self.url})
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    return json.loads(response.read())["rows"]
+            except urllib.error.HTTPError as err:
+                body = json.loads(err.read() or b"{}")
+                if body.get("code") == "23505":   # unique_violation
+                    raise DuplicateError() from err
+                if err.code < 500 or attempt == 2:
+                    raise RuntimeError(f"Database error: {body.get('message', err.code)}") from err
+            except (urllib.error.URLError, TimeoutError, ConnectionError):
+                if attempt == 2:
+                    raise
+            time.sleep(0.5 * (attempt + 1))   # brief retry, e.g. while Neon wakes up
+
+    def init(self):
+        for sql in (
+            """CREATE TABLE IF NOT EXISTS users (
+                   id       BIGSERIAL PRIMARY KEY,
+                   username TEXT NOT NULL,
+                   pw_hash  TEXT NOT NULL,
+                   salt     TEXT NOT NULL,
+                   wins     INTEGER NOT NULL DEFAULT 0,
+                   losses   INTEGER NOT NULL DEFAULT 0,
+                   draws    INTEGER NOT NULL DEFAULT 0,
+                   created  DOUBLE PRECISION NOT NULL)""",
+            "CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower ON users (lower(username))",
+            """CREATE TABLE IF NOT EXISTS sessions (
+                   token   TEXT PRIMARY KEY,
+                   user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                   expires DOUBLE PRECISION NOT NULL)""",
+            "CREATE INDEX IF NOT EXISTS sessions_expires ON sessions (expires)",
+        ):
+            self.query(sql)
+
+
+DB = NeonDB(DATABASE_URL) if DATABASE_URL else SqliteDB(DB_PATH)
+
+
+def db_all(sql, args=()):
+    return DB.query(sql, args)
 
 
 def db_one(sql, args=()):
-    with closing(db()) as conn:
-        return conn.execute(sql, args).fetchone()
+    rows = DB.query(sql, args)
+    return rows[0] if rows else None
 
 
 def init_db():
-    DB_PATH.parent.mkdir(exist_ok=True)
-    with closing(db()) as conn, conn:
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS users (
-                id       INTEGER PRIMARY KEY,
-                username TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                pw_hash  TEXT NOT NULL,
-                salt     TEXT NOT NULL,
-                wins     INTEGER NOT NULL DEFAULT 0,
-                losses   INTEGER NOT NULL DEFAULT 0,
-                draws    INTEGER NOT NULL DEFAULT 0,
-                created  REAL NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS sessions (
-                token   TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL REFERENCES users(id),
-                expires REAL NOT NULL
-            );
-        """)
+    DB.init()
 
 
 def hash_password(password, salt_hex):
     return hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt_hex), PBKDF2_ROUNDS).hex()
 
 
+# Logged-in users are remembered in memory for a minute, so not every request needs the database.
+_session_cache = {}   # token -> (user, cached_at)
+_session_lock = threading.Lock()
+SESSION_CACHE_SECONDS = 60
+
+
 def create_session(user_id):
     token = secrets.token_urlsafe(32)
-    db_exec("INSERT INTO sessions (token, user_id, expires) VALUES (?, ?, ?)",
-            (token, user_id, time.time() + SESSION_SECONDS))
+    db_all("INSERT INTO sessions (token, user_id, expires) VALUES (?, ?, ?)",
+           (token, user_id, time.time() + SESSION_SECONDS))
     return token
+
+
+def delete_session(token):
+    with _session_lock:
+        _session_cache.pop(token, None)
+    db_all("DELETE FROM sessions WHERE token = ?", (token,))
 
 
 def user_from_token(token):
     if not token:
         return None
+    now = time.time()
+    with _session_lock:
+        cached = _session_cache.get(token)
+    if cached and now - cached[1] < SESSION_CACHE_SECONDS:
+        return cached[0]
     row = db_one("""SELECT u.id, u.username FROM sessions s JOIN users u ON u.id = s.user_id
-                    WHERE s.token = ? AND s.expires > ?""", (token, time.time()))
-    return {"id": row["id"], "name": row["username"]} if row else None
+                    WHERE s.token = ? AND s.expires > ?""", (token, now))
+    user = {"id": int(row["id"]), "name": row["username"]} if row else None
+    with _session_lock:
+        if user:
+            _session_cache[token] = (user, now)
+        else:
+            _session_cache.pop(token, None)
+        if len(_session_cache) > 10_000:
+            _session_cache.clear()
+    return user
 
 
 def user_stats(user_id):
     row = db_one("SELECT wins, losses, draws FROM users WHERE id = ?", (user_id,))
-    return dict(row) if row else {"wins": 0, "losses": 0, "draws": 0}
+    if not row:
+        return {"wins": 0, "losses": 0, "draws": 0}
+    return {key: int(row[key]) for key in ("wins", "losses", "draws")}
 
 
 def record_result(game):
+    """Save a finished game to both players' stats (in the background, so play isn't delayed)."""
     x_id, o_id = game.players["X"]["id"], game.players["O"]["id"]
-    with closing(db()) as conn, conn:
-        if game.winner == "draw":
-            conn.execute("UPDATE users SET draws = draws + 1 WHERE id IN (?, ?)", (x_id, o_id))
-        else:
-            winner_id = game.players[game.winner]["id"]
-            loser_id = o_id if winner_id == x_id else x_id
-            conn.execute("UPDATE users SET wins = wins + 1 WHERE id = ?", (winner_id,))
-            conn.execute("UPDATE users SET losses = losses + 1 WHERE id = ?", (loser_id,))
+    if game.winner == "draw":
+        sql, args = "UPDATE users SET draws = draws + 1 WHERE id IN (?, ?)", (x_id, o_id)
+    else:
+        winner_id = game.players[game.winner]["id"]
+        sql = """UPDATE users SET wins   = wins   + CASE WHEN id = ? THEN 1 ELSE 0 END,
+                                  losses = losses + CASE WHEN id = ? THEN 0 ELSE 1 END
+                 WHERE id IN (?, ?)"""
+        args = (winner_id, winner_id, x_id, o_id)
+
+    def save():
+        try:
+            db_all(sql, args)
+        except Exception:
+            traceback.print_exc()
+
+    threading.Thread(target=save, daemon=True).start()
 
 
 # --------------------------------------------------------------------------- games
@@ -370,10 +486,11 @@ def janitor():
                 idle = now - game.updated
                 if (game.status == "finished" and idle > 10 * 60) or idle > 60 * 60:
                     game.close()
-        try:
-            db_exec("DELETE FROM sessions WHERE expires < ?", (now,))
-        except sqlite3.Error:
-            traceback.print_exc()
+        if int(now) % 3600 < 60:   # about once an hour is plenty
+            try:
+                db_all("DELETE FROM sessions WHERE expires < ?", (now,))
+            except Exception:
+                traceback.print_exc()
 
 
 # --------------------------------------------------------------------------- HTTP
@@ -503,18 +620,21 @@ class Handler(BaseHTTPRequestHandler):
         if not 6 <= len(password) <= 200:
             raise ApiError("Password must be at least 6 characters.")
         salt = secrets.token_hex(16)
-        try:
-            user_id = db_exec("INSERT INTO users (username, pw_hash, salt, created) VALUES (?, ?, ?, ?)",
-                              (username, hash_password(password, salt), salt, time.time()))
-        except sqlite3.IntegrityError:
+        if db_one("SELECT id FROM users WHERE lower(username) = lower(?)", (username,)):
             raise ApiError("That username is already taken.", 409)
+        try:
+            row = db_one("INSERT INTO users (username, pw_hash, salt, created) VALUES (?, ?, ?, ?) RETURNING id",
+                         (username, hash_password(password, salt), salt, time.time()))
+        except DuplicateError:   # two people picked the same name at the same moment
+            raise ApiError("That username is already taken.", 409)
+        user_id = int(row["id"])
         token = create_session(user_id)
         return {"user": {"id": user_id, "name": username}}, [session_cookie(token, self.is_https())]
 
     def login(self, body):
         username = str(body.get("username", "")).strip()
         password = str(body.get("password", ""))
-        row = db_one("SELECT id, username, pw_hash, salt FROM users WHERE username = ?", (username,))
+        row = db_one("SELECT id, username, pw_hash, salt FROM users WHERE lower(username) = lower(?)", (username,))
         if row:
             ok = hmac.compare_digest(hash_password(password, row["salt"]), row["pw_hash"])
         else:
@@ -522,13 +642,14 @@ class Handler(BaseHTTPRequestHandler):
             ok = False
         if not ok:
             raise ApiError("Wrong username or password.", 401)
-        token = create_session(row["id"])
-        return {"user": {"id": row["id"], "name": row["username"]}}, [session_cookie(token, self.is_https())]
+        user_id = int(row["id"])
+        token = create_session(user_id)
+        return {"user": {"id": user_id, "name": row["username"]}}, [session_cookie(token, self.is_https())]
 
     def logout(self):
         token = self.session_token()
         if token:
-            db_exec("DELETE FROM sessions WHERE token = ?", (token,))
+            delete_session(token)
         return {"ok": True}, [session_cookie("", self.is_https(), max_age=0)]
 
     def me(self):
@@ -545,10 +666,11 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("", "/"):
             path = "/index.html"
         target = (PUBLIC / path.lstrip("/")).resolve()
-        if not target.is_relative_to(PUBLIC) or not target.is_file():
+        content_type = CONTENT_TYPES.get(target.suffix.lower())
+        # Only web file types are served, so server.py and the database can never be downloaded.
+        if not content_type or not target.is_relative_to(PUBLIC) or not target.is_file():
             self.send_body(404, b"Not found", "text/plain; charset=utf-8")
             return
-        content_type = CONTENT_TYPES.get(target.suffix.lower(), "application/octet-stream")
         self.send_body(200, target.read_bytes(), content_type)
 
 
@@ -566,6 +688,7 @@ def main():
     threading.Thread(target=janitor, daemon=True).start()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"Tic-Tac-Toe server running on http://localhost:{PORT}", flush=True)
+    print(f"Accounts are saved in: {DB.name}", flush=True)
     ip = lan_address()
     if ip and HOST == "0.0.0.0":
         print(f"On a phone on the same Wi-Fi, open http://{ip}:{PORT}", flush=True)
