@@ -1,0 +1,10 @@
+# Render "Blueprint": tells Render how to run the game server.
+# https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: tictactoe-online
+    runtime: python
+    plan: free
+    buildCommand: "echo 'No packages to install'"
+    startCommand: "python server.py"
+    healthCheckPath: /

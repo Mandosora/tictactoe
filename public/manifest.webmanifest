@@ -1,0 +1,12 @@
+{
+  "name": "Tic-Tac-Toe Online",
+  "short_name": "Tic-Tac-Toe",
+  "description": "Log in and play tic-tac-toe online with a friend.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f4f5fb",
+  "theme_color": "#4f46e5",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}

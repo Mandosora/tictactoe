@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Tic-Tac-Toe Online</title>
+  <meta name="description" content="Log in and play tic-tac-toe online with a friend.">
+  <meta name="theme-color" content="#4f46e5">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Tic-Tac-Toe">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main class="app">
+
+    <!-- Loading -->
+    <section id="screen-loading" class="screen active" aria-label="Loading">
+      <div class="spinner"></div>
+    </section>
+
+    <!-- Log in / sign up -->
+    <section id="screen-auth" class="screen">
+      <div class="brand">
+        <img src="/icon.svg" alt="" class="logo" width="72" height="72">
+        <h1>Tic-Tac-Toe</h1>
+        <p class="muted">Play online with a friend</p>
+      </div>
+      <div class="tabs" role="tablist">
+        <button class="tab active" type="button" data-mode="login" role="tab">Log in</button>
+        <button class="tab" type="button" data-mode="register" role="tab">Sign up</button>
+      </div>
+      <form id="auth-form" class="card form" novalidate>
+        <label>Username
+          <input id="auth-username" name="username" autocomplete="username" autocapitalize="none"
+                 spellcheck="false" maxlength="20" required>
+        </label>
+        <label>Password
+          <input id="auth-password" name="password" type="password" autocomplete="current-password" required>
+        </label>
+        <p id="auth-hint" class="muted small" hidden>3–20 letters, numbers or _ · password at least 6 characters</p>
+        <p id="auth-error" class="error" role="alert" hidden></p>
+        <button id="auth-submit" class="btn primary" type="submit">Log in</button>
+      </form>
+    </section>
+
+    <!-- Lobby -->
+    <section id="screen-lobby" class="screen">
+      <header class="topbar">
+        <div>
+          <p class="muted small">Signed in as</p>
+          <h2 id="lobby-name"></h2>
+        </div>
+        <button id="logout" class="btn ghost small" type="button">Log out</button>
+      </header>
+      <div class="card stats">
+        <div><strong id="stat-wins">0</strong><span>Wins</span></div>
+        <div><strong id="stat-losses">0</strong><span>Losses</span></div>
+        <div><strong id="stat-draws">0</strong><span>Draws</span></div>
+      </div>
+      <button id="quick" class="btn primary big" type="button">Find an opponent</button>
+      <button id="create" class="btn secondary big" type="button">Play with a friend</button>
+      <form id="join-form" class="card form join" novalidate>
+        <label for="join-code">Got a code from a friend?</label>
+        <div class="row">
+          <input id="join-code" maxlength="4" placeholder="ABCD" autocomplete="off"
+                 autocapitalize="characters" spellcheck="false">
+          <button class="btn primary" type="submit">Join</button>
+        </div>
+      </form>
+      <p id="lobby-error" class="error center" role="alert" hidden></p>
+    </section>
+
+    <!-- Game -->
+    <section id="screen-game" class="screen">
+      <header class="players">
+        <div class="player" id="player-X">
+          <svg class="mark static" viewBox="0 0 100 100" aria-hidden="true"><path class="x" d="M24 24 76 76M76 24 24 76"/></svg>
+          <span class="pname"></span>
+        </div>
+        <span class="vs">vs</span>
+        <div class="player" id="player-O">
+          <svg class="mark static" viewBox="0 0 100 100" aria-hidden="true"><circle class="o" cx="50" cy="50" r="28"/></svg>
+          <span class="pname"></span>
+        </div>
+      </header>
+
+      <div id="waiting" class="card waiting" hidden>
+        <div id="code-block">
+          <p>Share this code with your friend</p>
+          <div id="game-code" class="code"></div>
+          <button id="share-code" class="btn secondary small" type="button" hidden>Share code</button>
+        </div>
+        <div class="spinner small-spinner"></div>
+        <p id="waiting-text" class="muted small"></p>
+      </div>
+
+      <p id="status" class="status" aria-live="polite"></p>
+      <div id="board" class="board" role="grid" aria-label="Game board"></div>
+      <p id="presence" class="muted small center"></p>
+
+      <div class="actions">
+        <button id="rematch" class="btn primary" type="button" hidden>Play again</button>
+        <button id="leave" class="btn ghost" type="button">Leave game</button>
+      </div>
+    </section>
+
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>
